@@ -1,17 +1,10 @@
-# model_mm_joint_uav_lidar.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18, ResNet18_Weights
 
-# -----------------------------
-# 将所有 UAV 与 LiDAR 一起注意力融合的模块
-# -----------------------------
 def sinusoidal_position_encoding(L, D, device):
-    """
-    生成长度 L、维度 D 的正弦位置编码（Transformer 经典实现）
-    """
     pe = torch.zeros(L, D, device=device)
     position = torch.arange(0, L, dtype=torch.float32, device=device).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, D, 2, device=device).float() * (-math.log(10000.0) / D))
@@ -43,14 +36,7 @@ class RAWImage(nn.Module):
         h  = self.img_head(h)
         return h
 
-# -----------------------------
-# LiDAR 编码（保持原逻辑）
-# -----------------------------
 class LidarMARCUS(nn.Module):
-    """
-    输入支持 (B,20,20,20) 或 (B,1,20,20,20)；内部按 Conv2d 处理为 (B, C=20, H=20, W=20)
-    最终输出 (B,512)，带 tanh。
-    """
     def __init__(self, channel, fusion, emb_dim, dropout):
         super().__init__()
         channel = 32; 
@@ -99,19 +85,11 @@ class LidarMARCUS(nn.Module):
         for name, param in self.named_parameters():
             if any(x in name for x in ["fc1.weight", "fc2.weight",
                                        "fc1.bias", "fc2.bias"]) and param.requires_grad:
-                l1_loss += torch.sum(torch.abs(param))  # L1 正则化
+                l1_loss += torch.sum(torch.abs(param))
                 l2_loss += torch.sum(param ** 2)
         return self.reg_l1 * l1_loss + self.reg_l2 * l2_loss
 
-# -----------------------------
-# 五视角 → 单UAV 256：视角轴 1D-CNN 融合
-# -----------------------------
 class AggIMAGEConv(nn.Module):
-    """
-    输入：每架 UAV 的 5 视角特征 (B, 5, 256)
-    过程：转置为 (B, 256, 5)，沿“视角轴”做 Conv1d → BN → GELU → 残差 → 池化
-    输出：(B, 256)
-    """
     def __init__(self, d, ksize, dropout):
         super().__init__()
         pad = (ksize - 1) // 2
@@ -136,15 +114,7 @@ class AggIMAGEConv(nn.Module):
         y_mean = y.mean(dim=-1)          # (B,256)
         return y_mean
 
-# -----------------------------
-# UAV 全编码：把 (B,K,5,3,H,W) → (B,K,256)
-# -----------------------------
 class UAViamgeAgg(nn.Module):
-    """
-    - 共享的图像编码器 RAWImage（对所有 UAV 的 5*图统一编码）
-    - 用 AggIMAGEConv 沿视角轴卷积融合
-    输出：(B,K,256)
-    """
     def __init__(self, emb_dim, ksize, uav_dropout, detection = False):
         super().__init__()
         self.img_enc = RAWImage(emb_dim=emb_dim)
@@ -178,7 +148,6 @@ class HETEattenFUSION(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # 类型嵌入：区分 fuse / LiDAR / UAV
         self.fuse_type = nn.Parameter(torch.zeros(1, 1, d_model))
         self.uav_type  = nn.Parameter(torch.zeros(1, 1, d_model))
         self.lidar_type = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -186,11 +155,9 @@ class HETEattenFUSION(nn.Module):
         nn.init.trunc_normal_(self.uav_type,  std=0.02)
         nn.init.trunc_normal_(self.lidar_type, std=0.02)
 
-        # 独立聚合 token（中性，不偏任何模态）
         self.fuse_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.fuse_token, std=0.02)
 
-        # Transformer 编码器
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward, dropout=dropout,
@@ -198,7 +165,6 @@ class HETEattenFUSION(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers, enable_nested_tensor=False)
 
-        # 输出头
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, dim_feedforward),
@@ -216,12 +182,10 @@ class HETEattenFUSION(nn.Module):
         B = f_uav.size(0)
         device = f_uav.device
 
-        # 1) 组装序列: [fuse] + [lidar] + [uav...]
         fuse = self.fuse_token.expand(B, 1, -1)   # (B,1,D)
         f_lidar = f_lidar.unsqueeze(1)            # (B,1,D)
         x = torch.cat([fuse, f_lidar, f_uav], dim=1)  # (B, 1+1+K, D)
 
-        # 2) 类型嵌入
         type_embed = torch.cat([
             self.fuse_type.expand(B, 1, -1),
             self.lidar_type.expand(B, 1, -1),
@@ -229,29 +193,22 @@ class HETEattenFUSION(nn.Module):
         ], dim=1)  # (B, 1+1+K, D)
         x = x + type_embed
 
-        # 3) 位置编码（正弦 PE）
         L = x.size(1)
         pe = sinusoidal_position_encoding(L, self.d_model, device).unsqueeze(0)  # (1,L,D)
         x = x + pe
 
-        # 4) Transformer 自注意力
         h = self.encoder(x, src_key_padding_mask=None)   # (B,L,D)
 
-        # 5) 从 fuse token（序列首位）读出
         fused = h[:, 0, :]                                # (B,D)
         out = self.mlp_head(fused)                        # (B,D)
         return out
-
-# -----------------------------
-# 主模型：一次性把 K 个 UAV + 1 个 LiDAR 放进注意力融合
-# -----------------------------
+        
 class MultiModalFusionModel(nn.Module):
     def __init__(self,
                  img_in_shape=(3,108,192),
-                 uav_emb_dim=256,            # 保持 256
-                 car_emb_dim=256,            # LiDAR 256
+                 uav_emb_dim=256,
+                 car_emb_dim=256,
                  num_classes=28,
-                 # 五视角聚合 & 注意力的宽度一致使用 256
                  attn_d_model=256,
                  attn_nhead=4,
                  attn_num_layers=2,
@@ -262,18 +219,14 @@ class MultiModalFusionModel(nn.Module):
                  ):
         super().__init__()
 
-        # K 架 UAV（每架 5 视角） → (B,K,256)
         self.uav_enc = UAViamgeAgg(emb_dim=uav_emb_dim,
             ksize=3, uav_dropout=uav_dropout
         )
 
-        # LiDAR 编码 → (B,256)
         self.lidar_enc = LidarMARCUS(channel = 32, fusion=True, emb_dim=car_emb_dim, dropout=car_dropout)
-        # 直接把 (K 个 UAV + 1 个 LiDAR) 一起做自注意力融合 → (B,256)
         self.joint_fusion = HETEattenFUSION(
             d_model=attn_d_model, nhead=attn_nhead, num_layers=attn_num_layers, dim_feedforward=attn_ff, dropout=fusion_dropout)
 
-        # 分类
         self.handsoff = nn.Sequential(
             nn.LayerNorm(attn_d_model),
             nn.Linear(attn_d_model, num_classes),
@@ -281,21 +234,8 @@ class MultiModalFusionModel(nn.Module):
         )
 
     def forward(self, lidar, uav_images):
-        """
-        lidar:       (B,20,20,20) or (B,1,20,20,20)
-        uav_images:  (B, K, 5, 3, H, W)
-        return:      (B, num_classes)
-        """
-        # UAV：五视角卷积融合（逐 UAV，但一次性向量化计算）
         f_uav = self.uav_enc(uav_images)       # (B,K,256)
-
-        # LiDAR：编码
         f_lidar = self.lidar_enc(lidar)        # (B,512)
-
-        # 联合注意力：把 K 个 UAV token + 1 个 LiDAR token 直接做自注意力
         f_fused = self.joint_fusion(f_uav, f_lidar)  # (B,256)
-
-        # 分类
         logits = self.handsoff(f_fused)      # (B,num_classes)
-
         return logits
